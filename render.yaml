@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: crypto-arb-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # set manually in Render dashboard
+    healthCheckPath: /health
+    autoDeploy: true
