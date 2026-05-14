@@ -2,10 +2,15 @@ services:
   - type: web
     name: crypto-arb-bot
     runtime: python
+    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false          # set manually in Render dashboard
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
     healthCheckPath: /health
     autoDeploy: true
