@@ -3,12 +3,6 @@ exchange_service.py
 ──────────────────────────────────────────────────────────────────────────────
 CEX  → ccxt async  : Binance, Bybit, OKX, MEXC, KuCoin, BingX, Bitget, Gate
 DEX  → HTTP APIs   : DexScreener, GMGN, Aster.finance (Jupiter/Solana)
- 
-Fixes:
-- Use asyncio resolver (not aiodns) to avoid DNS issues on Render free tier
-- GMGN 403 → fallback to DexScreener Solana data
-- Aster DNS fail → use Jupiter Price API via token symbol directly
-- CEX timeouts → increased timeout + asyncio resolver connector
 ──────────────────────────────────────────────────────────────────────────────
 """
  
@@ -16,7 +10,7 @@ from __future__ import annotations
  
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
  
 import aiohttp
@@ -24,8 +18,30 @@ import ccxt.async_support as ccxt
  
 logger = logging.getLogger(__name__)
  
-FETCH_TIMEOUT    = 20   # seconds — increased for Render free tier
+FETCH_TIMEOUT    = 20
 DEX_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
+ 
+# Minimum USD liquidity for DEX pairs — filters out illiquid wrapped tokens
+DEX_MIN_LIQUIDITY_USD = 50_000
+ 
+ 
+# ── Chart URLs per exchange ────────────────────────────────────────────────────
+def chart_url(exchange: str, ticker: str) -> str:
+    t = ticker.upper()
+    urls = {
+        "Binance":     f"https://www.binance.com/en/trade/{t}_USDT",
+        "Bybit":       f"https://www.bybit.com/trade/usdt/{t}USDT",
+        "OKX":         f"https://www.okx.com/trade-spot/{t.lower()}-usdt",
+        "MEXC":        f"https://www.mexc.com/exchange/{t}_USDT",
+        "KuCoin":      f"https://www.kucoin.com/trade/{t}-USDT",
+        "BingX":       f"https://bingx.com/en-us/spot/{t}USDT/",
+        "Bitget":      f"https://www.bitget.com/spot/{t}USDT",
+        "Gate":        f"https://www.gate.io/trade/{t}_USDT",
+        "DexScreener": f"https://dexscreener.com/solana/{t}",
+        "GMGN":        f"https://gmgn.ai/sol/token/{t}",
+        "Aster":       f"https://aster.finance/swap?inputMint=So11111111111111111111111111111111111111112&outputMint={t}",
+    }
+    return urls.get(exchange, "")
  
  
 # ── CEX registry ───────────────────────────────────────────────────────────────
@@ -42,16 +58,19 @@ CEX_FACTORIES: dict[str, type[ccxt.Exchange]] = {
  
  
 def _make_cex_pool() -> dict[str, ccxt.Exchange]:
-    return {name: cls({"enableRateLimit": True}) for name, cls in CEX_FACTORIES.items()}
+    return {
+        name: cls({
+            "enableRateLimit": True,
+            # Skip auto-loading markets on init — avoids heavy exchangeInfo requests
+            "options": {"fetchMarkets": False, "loadAllOptions": False},
+        })
+        for name, cls in CEX_FACTORIES.items()
+    }
  
  
 def _make_session() -> aiohttp.ClientSession:
-    """
-    Create aiohttp session with asyncio resolver.
-    Render free tier has issues with aiodns (default) — asyncio resolver fixes it.
-    """
     connector = aiohttp.TCPConnector(
-        resolver=aiohttp.AsyncResolver(),   # uses asyncio, not aiodns
+        resolver=aiohttp.AsyncResolver(),
         ssl=True,
         limit=20,
     )
@@ -70,95 +89,105 @@ class PriceResult:
     fair_price: Optional[float] = None
     exchange_type: str = "CEX"
     error: Optional[str] = None
+    url: str = ""
  
  
 # ══════════════════════════════════════════════════════════════════════════════
 #  CEX
 # ══════════════════════════════════════════════════════════════════════════════
-async def _fetch_cex(name: str, exchange: ccxt.Exchange, symbol: str) -> PriceResult:
+async def _fetch_cex(name: str, exchange: ccxt.Exchange, symbol: str, ticker: str) -> PriceResult:
+    url = chart_url(name, ticker)
     try:
-        ticker = await asyncio.wait_for(
+        data = await asyncio.wait_for(
             exchange.fetch_ticker(symbol), timeout=FETCH_TIMEOUT
         )
-        last: Optional[float] = ticker.get("last")
-        bid:  Optional[float] = ticker.get("bid")
-        ask:  Optional[float] = ticker.get("ask")
+        last: Optional[float] = data.get("last")
+        bid:  Optional[float] = data.get("bid")
+        ask:  Optional[float] = data.get("ask")
  
         if last is None:
-            return PriceResult(exchange=name, error="last=None", exchange_type="CEX")
+            return PriceResult(exchange=name, error="last=None", exchange_type="CEX", url=url)
  
         fair: Optional[float] = None
         if bid and ask and bid > 0 and ask > 0:
             fair = (bid + ask) / 2
  
-        return PriceResult(exchange=name, price=last, fair_price=fair, exchange_type="CEX")
+        return PriceResult(exchange=name, price=last, fair_price=fair, exchange_type="CEX", url=url)
  
     except asyncio.TimeoutError:
-        return PriceResult(exchange=name, error="Таймаут", exchange_type="CEX")
+        return PriceResult(exchange=name, error="Таймаут", exchange_type="CEX", url=url)
     except ccxt.BadSymbol:
-        return PriceResult(exchange=name, error="Тикер не найден", exchange_type="CEX")
+        return PriceResult(exchange=name, error="Тикер не найден", exchange_type="CEX", url=url)
     except ccxt.NetworkError as e:
-        return PriceResult(exchange=name, error=f"Сеть: {e}", exchange_type="CEX")
+        # Trim long ccxt network errors (they include full URL + response body)
+        short = str(e).split("\n")[0][:120]
+        return PriceResult(exchange=name, error=f"Сеть: {short}", exchange_type="CEX", url=url)
     except ccxt.ExchangeError as e:
-        return PriceResult(exchange=name, error=f"Биржа: {e}", exchange_type="CEX")
+        short = str(e).split("\n")[0][:120]
+        return PriceResult(exchange=name, error=f"Биржа: {short}", exchange_type="CEX", url=url)
     except Exception as e:
         logger.exception("CEX %s error for %s", name, symbol)
-        return PriceResult(exchange=name, error=str(e)[:80], exchange_type="CEX")
+        return PriceResult(exchange=name, error=str(e)[:100], exchange_type="CEX", url=url)
  
  
 # ══════════════════════════════════════════════════════════════════════════════
 #  DEX — DexScreener
 # ══════════════════════════════════════════════════════════════════════════════
 async def _fetch_dexscreener(session: aiohttp.ClientSession, ticker: str) -> PriceResult:
-    url = f"https://api.dexscreener.com/latest/dex/search?q={ticker}%2FUSDT"
+    url = chart_url("DexScreener", ticker)
+    api_url = f"https://api.dexscreener.com/latest/dex/search?q={ticker}%2FUSDT"
     try:
-        async with session.get(url) as resp:
+        async with session.get(api_url) as resp:
             resp.raise_for_status()
             data = await resp.json(content_type=None)
  
         pairs = data.get("pairs") or []
+ 
+        # Filter: correct base token + minimum liquidity to avoid wrapped/illiquid tokens
         matched = [
             p for p in pairs
             if p.get("baseToken", {}).get("symbol", "").upper() == ticker.upper()
+            and float((p.get("liquidity") or {}).get("usd", 0) or 0) >= DEX_MIN_LIQUIDITY_USD
         ]
         sol_pairs = [p for p in matched if p.get("chainId") == "solana"]
         candidates = sol_pairs or matched
  
         if not candidates:
-            # try USDC pair fallback
-            return PriceResult(exchange="DexScreener", error="Пара не найдена", exchange_type="DEX")
+            return PriceResult(exchange="DexScreener", error="Пара не найдена или низкая ликвидность", exchange_type="DEX", url=url)
  
-        best = max(
-            candidates,
-            key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0),
-        )
+        best = max(candidates, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+ 
+        # Update URL to exact pair
+        pair_addr = best.get("pairAddress", "")
+        chain = best.get("chainId", "solana")
+        if pair_addr:
+            url = f"https://dexscreener.com/{chain}/{pair_addr}"
+ 
         price_str = best.get("priceUsd")
         if not price_str:
-            return PriceResult(exchange="DexScreener", error="Нет priceUsd", exchange_type="DEX")
+            return PriceResult(exchange="DexScreener", error="Нет priceUsd", exchange_type="DEX", url=url)
  
         price = float(price_str)
-        return PriceResult(exchange="DexScreener", price=price, fair_price=price, exchange_type="DEX")
+        return PriceResult(exchange="DexScreener", price=price, fair_price=price, exchange_type="DEX", url=url)
  
     except asyncio.TimeoutError:
-        return PriceResult(exchange="DexScreener", error="Таймаут", exchange_type="DEX")
+        return PriceResult(exchange="DexScreener", error="Таймаут", exchange_type="DEX", url=url)
     except Exception as e:
         logger.exception("DexScreener error for %s", ticker)
-        return PriceResult(exchange="DexScreener", error=str(e)[:80], exchange_type="DEX")
+        return PriceResult(exchange="DexScreener", error=str(e)[:80], exchange_type="DEX", url=url)
  
  
 # ══════════════════════════════════════════════════════════════════════════════
-#  DEX — GMGN (Solana) with fallback
+#  DEX — GMGN
 # ══════════════════════════════════════════════════════════════════════════════
 async def _fetch_gmgn(session: aiohttp.ClientSession, ticker: str) -> PriceResult:
-    """
-    GMGN sometimes returns 403. Falls back to DexScreener GMGN-listed pairs.
-    """
-    url = "https://gmgn.ai/defi/quotation/v1/tokens/sol/search"
+    url = chart_url("GMGN", ticker)
+    api_url = "https://gmgn.ai/defi/quotation/v1/tokens/sol/search"
     params = {"q": ticker, "limit": "5"}
     try:
-        async with session.get(url, params=params) as resp:
+        async with session.get(api_url, params=params) as resp:
             if resp.status == 403:
-                return PriceResult(exchange="GMGN", error="403 Forbidden (требует авторизацию)", exchange_type="DEX")
+                return PriceResult(exchange="GMGN", error="403 Forbidden (только браузер)", exchange_type="DEX", url=url)
             resp.raise_for_status()
             data = await resp.json(content_type=None)
  
@@ -167,59 +196,61 @@ async def _fetch_gmgn(session: aiohttp.ClientSession, ticker: str) -> PriceResul
             (t for t in tokens if t.get("symbol", "").upper() == ticker.upper()), None
         )
         if not match:
-            return PriceResult(exchange="GMGN", error="Токен не найден", exchange_type="DEX")
+            return PriceResult(exchange="GMGN", error="Токен не найден", exchange_type="DEX", url=url)
  
         raw_price = match.get("price") or match.get("price_usd") or match.get("usd_price")
         if raw_price is None:
-            return PriceResult(exchange="GMGN", error="Нет поля price", exchange_type="DEX")
+            return PriceResult(exchange="GMGN", error="Нет поля price", exchange_type="DEX", url=url)
+ 
+        # Update URL with actual token address if available
+        addr = match.get("address") or match.get("mint")
+        if addr:
+            url = f"https://gmgn.ai/sol/token/{addr}"
  
         price = float(raw_price)
-        return PriceResult(exchange="GMGN", price=price, fair_price=price, exchange_type="DEX")
+        return PriceResult(exchange="GMGN", price=price, fair_price=price, exchange_type="DEX", url=url)
  
     except asyncio.TimeoutError:
-        return PriceResult(exchange="GMGN", error="Таймаут", exchange_type="DEX")
+        return PriceResult(exchange="GMGN", error="Таймаут", exchange_type="DEX", url=url)
     except Exception as e:
         logger.exception("GMGN error for %s", ticker)
-        return PriceResult(exchange="GMGN", error=str(e)[:80], exchange_type="DEX")
+        return PriceResult(exchange="GMGN", error=str(e)[:80], exchange_type="DEX", url=url)
  
  
 # ══════════════════════════════════════════════════════════════════════════════
 #  DEX — Aster / Jupiter Price API v6
-#  Uses symbol directly — avoids DNS-failing token.jup.ag/all (large file)
 # ══════════════════════════════════════════════════════════════════════════════
- 
-# Known mint addresses for top tokens (avoids fetching 50MB token list)
 KNOWN_MINTS: dict[str, str] = {
-    "SOL":  "So11111111111111111111111111111111111111112",
-    "BTC":  "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",  # Wrapped BTC on Solana
-    "ETH":  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # Wrapped ETH
-    "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-    "WIF":  "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
-    "JUP":  "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "SOL":    "So11111111111111111111111111111111111111112",
+    "BTC":    "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",
+    "ETH":    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+    "USDC":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "BONK":   "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "WIF":    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "JUP":    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
     "POPCAT": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
-    "PEPE": "FdpPGBjMBonzCdE36H3CjDqp7vUfXhb9z8kQ8VHzJGXx",
+    "PYTH":   "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "RAY":    "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "ORCA":   "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+    "SAMO":   "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+    "MEME":   "MEMEcZdAvfQ1uiCGkZZuLPqeMHYMhqRqYWHuVFnZ2cE",
+    "PEPE":   "FdpPGBjMBonzCdE36H3CjDqp7vUfXhb9z8kQ8VHzJGXx",
+    "XRP":    "Ga7W9sJkL3BerNwzxPdkBBqEoAKPSExhfLh8QSZ1pump",  # Solana wrapped XRP (illiquid, expect mismatch)
 }
  
+ 
 async def _fetch_aster(session: aiohttp.ClientSession, ticker: str) -> PriceResult:
-    """
-    Aster.finance → Jupiter Price API v6.
-    Uses known mints dict first, then searches via Jupiter token search API.
-    """
-    price_url = "https://price.jup.ag/v6/price"
+    url = chart_url("Aster", ticker)
+    price_url  = "https://price.jup.ag/v6/price"
     search_url = "https://tokens.jup.ag/tokens"
  
     try:
         mint = KNOWN_MINTS.get(ticker.upper())
  
-        # If not in known mints, search via Jupiter tokens API
         if not mint:
-            async with session.get(
-                search_url,
-                params={"tags": "verified"},
-            ) as resp:
+            async with session.get(search_url, params={"tags": "verified"}) as resp:
                 if resp.status != 200:
-                    return PriceResult(exchange="Aster", error=f"Token search HTTP {resp.status}", exchange_type="DEX")
+                    return PriceResult(exchange="Aster", error=f"Token search HTTP {resp.status}", exchange_type="DEX", url=url)
                 tokens = await resp.json(content_type=None)
  
             for t in (tokens if isinstance(tokens, list) else []):
@@ -228,28 +259,31 @@ async def _fetch_aster(session: aiohttp.ClientSession, ticker: str) -> PriceResu
                     break
  
         if not mint:
-            return PriceResult(exchange="Aster", error="Минт не найден", exchange_type="DEX")
+            return PriceResult(exchange="Aster", error="Минт не найден", exchange_type="DEX", url=url)
+ 
+        # Update Aster URL with mint
+        url = f"https://aster.finance/swap?inputMint=So11111111111111111111111111111111111111112&outputMint={mint}"
  
         async with session.get(price_url, params={"ids": mint}) as resp:
             if resp.status != 200:
-                return PriceResult(exchange="Aster", error=f"Price API HTTP {resp.status}", exchange_type="DEX")
+                return PriceResult(exchange="Aster", error=f"Price API HTTP {resp.status}", exchange_type="DEX", url=url)
             price_data = await resp.json(content_type=None)
  
         info = (price_data.get("data") or {}).get(mint)
         if not info:
-            return PriceResult(exchange="Aster", error="Нет данных в ответе", exchange_type="DEX")
+            return PriceResult(exchange="Aster", error="Нет данных в ответе", exchange_type="DEX", url=url)
  
         price = float(info.get("price", 0))
         if price == 0:
-            return PriceResult(exchange="Aster", error="Цена = 0", exchange_type="DEX")
+            return PriceResult(exchange="Aster", error="Цена = 0", exchange_type="DEX", url=url)
  
-        return PriceResult(exchange="Aster", price=price, fair_price=price, exchange_type="DEX")
+        return PriceResult(exchange="Aster", price=price, fair_price=price, exchange_type="DEX", url=url)
  
     except asyncio.TimeoutError:
-        return PriceResult(exchange="Aster", error="Таймаут", exchange_type="DEX")
+        return PriceResult(exchange="Aster", error="Таймаут", exchange_type="DEX", url=url)
     except Exception as e:
         logger.exception("Aster error for %s", ticker)
-        return PriceResult(exchange="Aster", error=str(e)[:80], exchange_type="DEX")
+        return PriceResult(exchange="Aster", error=str(e)[:80], exchange_type="DEX", url=url)
  
  
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,7 +295,7 @@ async def get_prices_for_ticker(ticker: str) -> list[PriceResult]:
  
     async with _make_session() as session:
         cex_tasks = [
-            asyncio.create_task(_fetch_cex(name, ex, symbol))
+            asyncio.create_task(_fetch_cex(name, ex, symbol, ticker))
             for name, ex in cex_pool.items()
         ]
         dex_tasks = [
