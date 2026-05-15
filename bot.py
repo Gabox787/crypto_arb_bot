@@ -107,8 +107,7 @@ def build_response(ticker: str, results: list[PriceResult]) -> str:
  
     # ── DEX block ───────────────────────────────────────────────────────────────
     if dex_valid or dex_err:
-        lines.append("\n🔗 <b>DEX (Solana)</b>")
-        for r in dex_valid:
+        lines.append("\n🔗 <b>DEX (Solana)</b>")        for r in dex_valid:
             tag = ""
             if r.exchange == global_min.exchange:
                 tag = " 🟢 MIN"
@@ -167,7 +166,7 @@ async def cmd_start(message: Message) -> None:
         "👋 <b>Crypto Arbitrage Bot</b>\n\n"
         "Отправь тикер монеты — я сравню цены на <b>8 CEX + 3 DEX</b>.\n\n"
         "<b>CEX:</b> Binance · Bybit · OKX · MEXC · KuCoin · BingX · Bitget · Gate\n"
-        "<b>DEX (Solana):</b> DexScreener · GMGN · Aster.finance\n\n"
+        "<b>DEX (Solana):</b> DexScreener · Birdeye\n\n"
         "Примеры: <code>BTC</code>  <code>SOL</code>  <code>WIF</code>  <code>BONK</code>\n\n"
         "/help — справка"
     )
@@ -181,7 +180,7 @@ async def cmd_help(message: Message) -> None:
         "ℹ️ <b>Справка</b>\n\n"
         "Введи тикер монеты (только буквы, 2–10 символов).\n\n"
         "<b>CEX</b> — цена last + справедливая цена (bid+ask)/2\n"
-        "<b>DEX</b> — spot-цена из Solana ликвидности\n\n"
+        "<b>DEX</b> — Solana: DexScreener (пары с ликвидностью >$100k) + Birdeye\n\n"
         "Бот покажет:\n"
         "  • Цены по каждой площадке\n"
         "  • Спред внутри CEX\n"
@@ -223,7 +222,7 @@ async def handle_ticker(message: Message) -> None:
  
 # ── Entry point ─────────────────────────────────────────────────────────────────
 async def main() -> None:
-    logger.info("Starting bot — 8 CEX + 3 DEX (polling)…")
+    logger.info("Starting bot — 8 CEX + 2 DEX (polling)…")
     start_keep_alive()
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
  
