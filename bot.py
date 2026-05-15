@@ -99,9 +99,11 @@ def build_response(ticker: str, results: list[PriceResult]) -> str:
             fair_str = (
                 f"  <i>(fair: {fmt_price(r.fair_price)})</i>" if r.fair_price else ""
             )
-            lines.append(f"  <code>{r.exchange:<10}</code> ${fmt_price(r.price)}{tag}{fair_str}")
+            chart = f' <a href="{r.url}">📈</a>' if r.url else ""
+            lines.append(f"  <code>{r.exchange:<10}</code> ${fmt_price(r.price)}{tag}{fair_str}{chart}")
         for r in cex_err:
-            lines.append(f"  <code>{r.exchange:<10}</code> ⚠️ {r.error}")
+            chart = f' <a href="{r.url}">📈</a>' if r.url else ""
+            lines.append(f"  <code>{r.exchange:<10}</code> ⚠️ {r.error}{chart}")
  
     # ── DEX block ───────────────────────────────────────────────────────────────
     if dex_valid or dex_err:
@@ -112,9 +114,11 @@ def build_response(ticker: str, results: list[PriceResult]) -> str:
                 tag = " 🟢 MIN"
             elif r.exchange == global_max.exchange:
                 tag = " 🔴 MAX"
-            lines.append(f"  <code>{r.exchange:<12}</code> ${fmt_price(r.price)}{tag}")
+            chart = f' <a href="{r.url}">📈</a>' if r.url else ""
+            lines.append(f"  <code>{r.exchange:<12}</code> ${fmt_price(r.price)}{tag}{chart}")
         for r in dex_err:
-            lines.append(f"  <code>{r.exchange:<12}</code> ⚠️ {r.error}")
+            chart = f' <a href="{r.url}">📈</a>' if r.url else ""
+            lines.append(f"  <code>{r.exchange:<12}</code> ⚠️ {r.error}{chart}")
  
     # ── CEX-only spread ─────────────────────────────────────────────────────────
     if len(cex_valid) >= 2:
