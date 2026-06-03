@@ -224,7 +224,12 @@ async def handle_ticker(message: Message) -> None:
 async def main() -> None:
     logger.info("Starting bot — 8 CEX + 2 DEX (polling)…")
     start_keep_alive()
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        handle_signals=True,
+        polling_timeout=30,
+    )
  
  
 if __name__ == "__main__":
