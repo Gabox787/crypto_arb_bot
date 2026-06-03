@@ -107,7 +107,8 @@ def build_response(ticker: str, results: list[PriceResult]) -> str:
  
     # ── DEX block ───────────────────────────────────────────────────────────────
     if dex_valid or dex_err:
-        lines.append("\n🔗 <b>DEX (Solana)</b>")        for r in dex_valid:
+        lines.append("\n🔗 <b>DEX (Solana)</b>")
+        for r in dex_valid:
             tag = ""
             if r.exchange == global_min.exchange:
                 tag = " 🟢 MIN"
